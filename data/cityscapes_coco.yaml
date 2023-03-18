@@ -1,0 +1,16 @@
+# Cityscapes
+
+# train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
+train: ./cityscapes/images/train/  # 118287 images
+val: ./cityscapes/images/val/
+test: ./cityscapes/images/test/
+
+# number of classes
+nc: 35
+
+# class names
+names: ['unlabeled', 'ego vehicle', 'rectification border', 'out of roi', 'static', 'dynamic',
+        'ground', 'road', 'sidewalk', 'parking', 'rail track', 'building', 'wall', 'fence',
+        'guard rail', 'bridge', 'tunnel', 'pole', 'polegroup', 'traffic light','traffic sign',
+        'vegetation', 'terrain', 'sky', 'person', 'rider', 'car', 'truck', 'bus', 'caravan', 'trailer',
+        'train', 'motorcycle', 'bicycle', 'license plate']
