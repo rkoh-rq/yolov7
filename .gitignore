@@ -1,3 +1,9 @@
+# Cityscape dataset
+cityscapes
+
+# My temp output file
+outputs
+
 # Repo-specific GitIgnore ----------------------------------------------------------------------------------------------
 *.jpg
 *.jpeg
