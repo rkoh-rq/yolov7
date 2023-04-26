@@ -11,7 +11,7 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from models.head import ResizeHead, ResizeHeadClass
+from models.head import ResizeHead, ResizeHeadClass, ResizeHeadSigmoid
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
@@ -46,7 +46,9 @@ def test(data,
          v5_metric=False,
          resize=False,
          resize_class=False,
-         switch_class=False):
+         resize_ood=False,
+         switch_class=False,
+         switch_ood=False):
     set_logging()
     device = select_device(opt.device, batch_size=batch_size)
     task = "val"
@@ -57,9 +59,9 @@ def test(data,
     check_dataset(data)  # check
     dataloader = create_dataloader(data[task], imgsz, batch_size, 32, opt, pad=0.5, rect=True,
                                     prefix=colorstr(f'{task}: '))[0]
-    if (resize_class or resize):
+    if (resize_class or resize_ood or resize):
         datasets = {}
-        for i in range(192, imgsz+1, 32):
+        for i in [320, imgsz]: #range(192, imgsz+1, 32):
             datasets[i] = create_dataloader(data[task], i, batch_size, 32, opt, pad=0.5, rect=True,
                                     prefix=colorstr(f'{task}: '))[1]
 
@@ -75,6 +77,11 @@ def test(data,
         checkpoint = torch.load("runs/train/head_class")
         head.load_state_dict(checkpoint)
         head.eval()
+    if (resize_ood or switch_ood):
+        head = ResizeHeadSigmoid().to(device)
+        head.half()
+        checkpoint = torch.load("runs/train/head_ood")
+        head.load_state_dict(checkpoint)
 
     # Directories
     save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
@@ -86,21 +93,27 @@ def test(data,
         models.append(attempt_load(weights[0].replace('cityscapes8','rainy'), map_location=device))
         models.append(attempt_load(weights[0].replace('cityscapes8','darker'), map_location=device))
         models.append(attempt_load(weights[0].replace('cityscapes8','brighter'), map_location=device))
-        with open('image_labels_val.pickle', 'rb') as handle:
-            class_labels = pickle.load(handle)
+    if (switch_ood):
+        models = [model]
+        models.append(attempt_load(weights[0].replace('cityscapes8', 'mixed4'), map_location=device))
 
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(imgsz, s=gs)  # check img_size
     if trace:
-        if (switch_class):
+        if (switch_class or switch_ood):
             for i in range(len(models)):
                 models[i] = TracedModel(models[i], device, imgsz)
         else:
             model = TracedModel(model, device, imgsz)
+
+    
+    with open('image_labels_val.pickle', 'rb') as handle:
+        class_labels = pickle.load(handle)
+
     # Half
     half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
     if half:
-        if (switch_class):
+        if (switch_class or switch_ood):
             for model in models:
                 model.half()
         else:
@@ -121,6 +134,7 @@ def test(data,
     avg_size = 0
 
     label_to_int = {'none':0, 'rain':1, 'dark':2, 'bright':3}
+    ood_stats = {'none': [], 'rain': [], 'dark': [], 'bright': []}
 
     for di, (img, targets, paths, shapes) in enumerate(tqdm(dataloader)):
         img = img.to(device, non_blocking=True)
@@ -132,10 +146,20 @@ def test(data,
                 output = head(img)[0]
                 output_l = torch.argmax(output)
                 # output_l = label_to_int[class_labels[paths[0]]]
-            elif (resize_class):
+            elif (switch_ood):
+                output = head(img)[0]
+                output_l = 1 if output > 0.5 else 0
+            if (resize_class): 
                 output = head(img)[0]
                 output_l = torch.argmax(output)
                 resz = 320 if output_l == 0 else imgsz  # 1.
+                img = datasets[resz][di][0].unsqueeze(0).to(device)
+                img = img.half() if half else img.float()
+                img /= 255.0  # 0 - 255 to 0.0 - 1.0
+                avg_size += resz
+            elif (resize_ood):
+                output = head(img)[0]
+                resz = 320 if output < 0.5 else imgsz  # 1.
                 img = datasets[resz][di][0].unsqueeze(0).to(device)
                 img = img.half() if half else img.float()
                 img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -148,7 +172,7 @@ def test(data,
                 img /= 255.0  # 0 - 255 to 0.0 - 1.0
                 avg_size += resz
             # Run model
-            if (switch_class):
+            if (switch_class or switch_ood):
                 model = models[output_l]  # inference and training outputs
             t = time_synchronized()
             out, train_out = model(img)  # inference and training outputs
@@ -170,9 +194,12 @@ def test(data,
                 path = Path(paths[si])
                 seen += 1
 
+                ood_label = class_labels[str(path)]
+
                 if len(pred) == 0:
                     if nl:
                         stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                        ood_stats[ood_label].append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                     continue
 
                 # Predictions
@@ -235,8 +262,27 @@ def test(data,
 
                 # Append statistics (correct, conf, pcls, tcls)
                 stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-    if resize or resize_class:
+                ood_stats[ood_label].append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+
+    if resize or resize_class or resize_ood:
         print(avg_size/len(dataloader))
+
+    for i in ood_stats:
+        # Compute statistics
+        ood_stat_i = ood_stats[i]
+        ood_stat_i = [np.concatenate(x, 0) for x in zip(*ood_stat_i)]  # to numpy
+        if len(ood_stat_i) and ood_stat_i[0].any():
+            p, r, ap, f1, ap_class = ap_per_class(*ood_stat_i, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
+            ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+            mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+            nt = np.bincount(ood_stat_i[3].astype(np.int64), minlength=nc)  # number of targets per class
+        else:
+            nt = torch.zeros(1)
+
+        # Print results
+        pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
+        print(pf % (i, seen, nt.sum(), mp, mr, map50, map))
+
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
@@ -329,7 +375,9 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--resize', action='store_true', help='do resizing with regressor only. did not use in the end')
     parser.add_argument('--resize-class', action='store_true', help='do resizing based on class')
+    parser.add_argument('--resize-ood', action='store_true', help='do resizing based on ood')
     parser.add_argument('--switch-class', action='store_true', help='switch model weights')
+    parser.add_argument('--switch-ood', action='store_true', help='switch model weights if ood')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -354,5 +402,7 @@ if __name__ == '__main__':
              v5_metric=opt.v5_metric,
              resize=opt.resize,
              resize_class=opt.resize_class,
+             resize_ood=opt.resize_ood,
              switch_class=opt.switch_class,
+             switch_ood=opt.switch_ood,
              )

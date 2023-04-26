@@ -11,7 +11,7 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from models.head import ResizeHead
+from models.head import ResizeHeadClass
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
@@ -28,10 +28,9 @@ def test(data,
          dataloader=None):
     set_logging()
     device = select_device(opt.device, batch_size=batch_size)
-    with open('filename.pickle', 'rb') as handle:
-            losses = pickle.load(handle)
-    
-    task = "train"
+    with open('image_labels_val.pickle', 'rb') as handle:
+        labels = pickle.load(handle)
+    task = "val"
     # Configure
     if isinstance(data, str):
         with open(data) as f:
@@ -39,22 +38,28 @@ def test(data,
     check_dataset(data)  # check
     dataloader = create_dataloader(data[task], imgsz, batch_size, 32, opt, pad=0.5, rect=True,
                                     prefix=colorstr(f'{task}: '))[0]
-    head = ResizeHead((imgsz-192)//32).to(device)
-    checkpoint = torch.load("runs/train/head")
+    head = ResizeHeadClass(4).to(device)
+    checkpoint = torch.load("runs/train/head_class")
     head.load_state_dict(checkpoint)
     head.eval()
+    label_to_class = {'none': 0, 'rain': 1, 'dark': 2, 'bright': 3}
+    correct = 0
+    correcttype = 0
 
     for img, _, paths, _ in tqdm(dataloader):
         img = img.to(device, non_blocking=True)
         img = img.float()
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        targets = torch.Tensor([losses[p] for p in paths]).to(device)
+        targets = torch.Tensor([label_to_class[labels[p]] for p in paths]).to(device)
         output = head(img)
-        print(targets, output)
+        correct += torch.sum((torch.argmax(output, dim=1) > 0) == (targets > 0))
+        correcttype += torch.sum(torch.argmax(output, dim=1)  == targets )
+    print(correct)
+    print(correcttype)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test_head.py')
-    parser.add_argument('--data', type=str, default='data/coco.yaml', help='*.data path')
+    parser.add_argument('--data', type=str, default='data/cityscapes_coco.yaml', help='*.data path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')

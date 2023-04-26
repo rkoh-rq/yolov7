@@ -69,6 +69,7 @@ def test(data,
 
     # Configure
     model.eval()
+
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
@@ -93,6 +94,17 @@ def test(data,
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
     
+    # Cityscapes name to id
+    name_to_id = {}
+    cityclass = {}
+    if "cityscapes" in data['train']:
+        anno_json = "./cityscapes/annotations/instancesonly_filtered_gtFine_val.json"
+        aj = json.load(open(anno_json))
+        for aji in aj['images']:
+            name_to_id[aji['file_name'].split('.')[0]] = aji['id']
+        for ajc in aj['categories']:
+            cityclass[data['names'].index(ajc['name'])] = ajc['id']
+
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
@@ -166,14 +178,17 @@ def test(data,
             # Append to pycocotools JSON dictionary
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
-                image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+                image_id = int(path.stem) if path.stem.isnumeric() else name_to_id[path.stem]
                 box = xyxy2xywh(predn[:, :4])  # xywh
                 box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
                 for p, b in zip(pred.tolist(), box.tolist()):
-                    jdict.append({'image_id': image_id,
-                                  'category_id': coco91class[int(p[5])] if is_coco else int(p[5]),
-                                  'bbox': [round(x, 3) for x in b],
-                                  'score': round(p[4], 5)})
+                    try:
+                        jdict.append({'image_id': image_id,
+                                    'category_id': cityclass[int(p[5])] if 'cityscapes' in data['train'] else (coco91class[int(p[5])] if is_coco else int(p[5])),
+                                    'bbox': [round(x, 3) for x in b],
+                                    'score': round(p[4], 5)})
+                    except:
+                        pass
 
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
@@ -255,7 +270,7 @@ def test(data,
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = './coco/annotations/instances_val2017.json'  # annotations json
-        if "cityscapes" in data:
+        if "cityscapes" in data['train']:
             anno_json = "./cityscapes/annotations/instancesonly_filtered_gtFine_val.json"
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
@@ -269,7 +284,9 @@ def test(data,
             anno = COCO(anno_json)  # init annotations api
             pred = anno.loadRes(pred_json)  # init predictions api
             eval = COCOeval(anno, pred, 'bbox')
-            if is_coco:
+            if "cityscapes" in data['train']:
+                eval.params.imgIds = [int(name_to_id[Path(x).stem]) for x in dataloader.dataset.img_files]  # image IDs to evaluate
+            elif is_coco:
                 eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
             eval.evaluate()
             eval.accumulate()
